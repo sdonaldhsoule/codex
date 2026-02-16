@@ -192,6 +192,10 @@ body {
   animation: pointerWobble 2s ease-in-out infinite;
 }
 
+.clip-path-pointer {
+  clip-path: polygon(50% 100%, 0% 0%, 100% 0%);
+}
+
 @media (max-width: 768px) {
   .glass,
   .glass-card {
