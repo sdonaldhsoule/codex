@@ -44,10 +44,12 @@ export async function getNewApiUserId(linuxdoId: number): Promise<number | null>
 
   // 3. 若用户名规则未命中，按 linuxdo_id 精确匹配（可靠）
   if (!user) {
+    console.warn('[user-mapping] username candidates miss, fallback to linuxdo_id scan', { linuxdoId });
     user = await findUserByLinuxDoId(linuxdoId);
   }
 
   if (!user) {
+    console.warn('[user-mapping] newapi user not found', { linuxdoId });
     await kv.set(cacheKey, {
       newApiUserId: null,
       cachedAt: Date.now(),
@@ -57,6 +59,7 @@ export async function getNewApiUserId(linuxdoId: number): Promise<number | null>
   }
 
   // 4. 缓存映射
+  console.log('[user-mapping] newapi user mapped', { linuxdoId, newApiUserId: user.id });
   const mapping: UserMapping = {
     newApiUserId: user.id,
     cachedAt: Date.now(),

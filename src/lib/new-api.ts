@@ -9,7 +9,7 @@ const USER_QUOTA_LOCK_RETRY_MS = 120;
 const USER_QUOTA_LOCK_MAX_RETRIES = 25;
 const ADMIN_SESSION_CACHE_TTL_MS = 30 * 60 * 1000;
 const ADMIN_SESSION_REFRESH_WINDOW_MS = 5 * 60 * 1000;
-const ADMIN_USER_SCAN_MAX_PAGES = 120;
+const ADMIN_USER_SCAN_MAX_PAGES = 5000;
 
 type UserQuotaLock = {
   key: string;
@@ -287,15 +287,52 @@ function normalizeLinuxDoId(value: unknown): string {
   return "";
 }
 
+function findMatchByLinuxDoId(users: NewApiUser[], targetLinuxDoId: string): NewApiUser | null {
+  const matched = users.find(
+    (user) => normalizeLinuxDoId(user.linuxdo_id) === targetLinuxDoId
+  );
+  return matched ?? null;
+}
+
 export async function findUserByLinuxDoId(linuxdoId: number): Promise<NewApiUser | null> {
   const baseUrl = getNewApiUrl();
   const targetLinuxDoId = String(linuxdoId);
+  const keywordCandidates = [targetLinuxDoId, `linuxdo_${targetLinuxDoId}`, `linuxdo${targetLinuxDoId}`];
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const loginResult = await getAdminSessionWithUser(attempt > 0);
     if (!loginResult) return null;
 
     let authFailed = false;
+
+    // 先走 search 接口快速命中，减少全量分页扫描压力
+    for (const keyword of keywordCandidates) {
+      try {
+        const searchResponse = await fetch(
+          `${baseUrl}/api/user/search?keyword=${encodeURIComponent(keyword)}`,
+          {
+            headers: buildAdminHeaders(loginResult),
+          }
+        );
+        const searchData = await parseJsonSafe<NewApiResponse<NewApiUser | NewApiUser[]>>(searchResponse);
+
+        if (isAuthFailureResponse(searchResponse.status, searchData)) {
+          clearAdminSessionCache();
+          authFailed = true;
+          break;
+        }
+
+        if (searchResponse.ok && searchData?.success && searchData.data) {
+          const users = Array.isArray(searchData.data) ? searchData.data : [searchData.data];
+          const matched = findMatchByLinuxDoId(users, targetLinuxDoId);
+          if (matched) return matched;
+        }
+      } catch (error) {
+        console.error("Find user by linuxdoId via search error:", error);
+      }
+    }
+
+    if (authFailed) continue;
 
     for (let page = 0; page < ADMIN_USER_SCAN_MAX_PAGES; page += 1) {
       try {
@@ -315,9 +352,7 @@ export async function findUserByLinuxDoId(linuxdoId: number): Promise<NewApiUser
         }
 
         const users = data.data;
-        const matched = users.find(
-          (user) => normalizeLinuxDoId(user.linuxdo_id) === targetLinuxDoId
-        );
+        const matched = findMatchByLinuxDoId(users, targetLinuxDoId);
         if (matched) return matched;
 
         if (users.length === 0) break;
