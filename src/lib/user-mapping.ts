@@ -10,13 +10,15 @@ interface UserMapping {
 }
 
 /**
- * 根据 LinuxDo 用户名查找 newapi userId
+ * 根据 LinuxDo ID 查找 newapi userId
+ * NewAPI 用 LinuxDo 登录后，用户名格式为 linuxdo{linuxdoId}（如 linuxdo66994）
+ *
  * 1. 先查 Redis 缓存
- * 2. 缓存未命中或过期时调用 newapi admin API 搜索
+ * 2. 缓存未命中或过期时，用 "linuxdo{linuxdoId}" 搜索 newapi
  * 3. 缓存结果到 Redis
  */
-export async function getNewApiUserId(linuxdoUsername: string): Promise<number | null> {
-  const cacheKey = `${MAPPING_PREFIX}${linuxdoUsername}`;
+export async function getNewApiUserId(linuxdoId: number): Promise<number | null> {
+  const cacheKey = `${MAPPING_PREFIX}${linuxdoId}`;
 
   // 1. 查缓存
   const cached = await kv.get<UserMapping>(cacheKey);
@@ -27,8 +29,9 @@ export async function getNewApiUserId(linuxdoUsername: string): Promise<number |
     }
   }
 
-  // 2. 调用 newapi 搜索
-  const user = await searchUserByUsername(linuxdoUsername);
+  // 2. NewAPI 中 LinuxDo 登录用户的用户名格式: linuxdo{linuxdoId}
+  const newApiUsername = `linuxdo${linuxdoId}`;
+  const user = await searchUserByUsername(newApiUsername);
   if (!user) {
     return null;
   }
@@ -44,9 +47,9 @@ export async function getNewApiUserId(linuxdoUsername: string): Promise<number |
 }
 
 /**
- * 清除用户映射缓存（用于管理员手动刷新）
+ * 清除用户映射缓存
  */
-export async function clearUserMapping(linuxdoUsername: string): Promise<void> {
-  const cacheKey = `${MAPPING_PREFIX}${linuxdoUsername}`;
+export async function clearUserMapping(linuxdoId: number): Promise<void> {
+  const cacheKey = `${MAPPING_PREFIX}${linuxdoId}`;
   await kv.del(cacheKey);
 }

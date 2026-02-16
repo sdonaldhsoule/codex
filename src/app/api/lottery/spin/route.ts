@@ -10,12 +10,12 @@ export async function POST() {
   }
 
   try {
-    // 查找 newapi userId
-    const newApiUserId = await getNewApiUserId(user.username);
+    // 用 linuxdoId 查找 newapi userId（NewAPI 中用户名格式为 linuxdo{linuxdoId}）
+    const newApiUserId = await getNewApiUserId(user.linuxdoId);
     if (!newApiUserId) {
       return NextResponse.json({
         success: false,
-        message: "未找到对应的 API 账户，请先在 API 平台注册（用户名需与 LinuxDo 相同）",
+        message: "未找到对应的 API 账户，请先用 LinuxDo 登录 API 平台完成注册",
       }, { status: 400 });
     }
 
