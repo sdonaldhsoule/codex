@@ -9,6 +9,7 @@ const USER_QUOTA_LOCK_RETRY_MS = 120;
 const USER_QUOTA_LOCK_MAX_RETRIES = 25;
 const ADMIN_SESSION_CACHE_TTL_MS = 30 * 60 * 1000;
 const ADMIN_SESSION_REFRESH_WINDOW_MS = 5 * 60 * 1000;
+const ADMIN_USER_SCAN_MAX_PAGES = 120;
 
 type UserQuotaLock = {
   key: string;
@@ -86,6 +87,8 @@ export interface NewApiUser {
   email: string;
   quota: number;
   used_quota: number;
+  linuxdo_id?: string;
+  linuxdo_level?: number;
 }
 
 export async function loginToNewApi(
@@ -269,6 +272,62 @@ export async function searchUserByUsername(username: string): Promise<NewApiUser
       console.error("Search user error:", error);
       return null;
     }
+  }
+
+  return null;
+}
+
+function normalizeLinuxDoId(value: unknown): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(Math.trunc(value));
+  }
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  return "";
+}
+
+export async function findUserByLinuxDoId(linuxdoId: number): Promise<NewApiUser | null> {
+  const baseUrl = getNewApiUrl();
+  const targetLinuxDoId = String(linuxdoId);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const loginResult = await getAdminSessionWithUser(attempt > 0);
+    if (!loginResult) return null;
+
+    let authFailed = false;
+
+    for (let page = 0; page < ADMIN_USER_SCAN_MAX_PAGES; page += 1) {
+      try {
+        const response = await fetch(`${baseUrl}/api/user/?p=${page}`, {
+          headers: buildAdminHeaders(loginResult),
+        });
+        const data = await parseJsonSafe<NewApiResponse<NewApiUser[]>>(response);
+
+        if (isAuthFailureResponse(response.status, data)) {
+          clearAdminSessionCache();
+          authFailed = true;
+          break;
+        }
+
+        if (!response.ok || !data?.success || !Array.isArray(data.data)) {
+          return null;
+        }
+
+        const users = data.data;
+        const matched = users.find(
+          (user) => normalizeLinuxDoId(user.linuxdo_id) === targetLinuxDoId
+        );
+        if (matched) return matched;
+
+        if (users.length === 0) break;
+      } catch (error) {
+        console.error("Find user by linuxdoId error:", error);
+        return null;
+      }
+    }
+
+    if (!authFailed) break;
   }
 
   return null;
