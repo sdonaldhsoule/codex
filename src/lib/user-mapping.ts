@@ -37,7 +37,7 @@ export async function getNewApiUserId(linuxdoId: number, _linuxdoUsername?: stri
   // 2. 直接查 NewAPI 的 MySQL
   try {
     const row = await db.queryOne<{ id: number }>(
-      'SELECT id FROM users WHERE linuxdo_id = ? LIMIT 1',
+      'SELECT id FROM users WHERE linux_do_id = ? LIMIT 1',
       [String(linuxdoId)]
     );
 
