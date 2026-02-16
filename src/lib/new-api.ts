@@ -91,6 +91,16 @@ export interface NewApiUser {
   linuxdo_level?: number;
 }
 
+function normalizeUsername(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase();
+}
+
+function normalizeUserList(data: unknown): NewApiUser[] {
+  const list = Array.isArray(data) ? data : [data];
+  return list.filter((item): item is NewApiUser => !!item && typeof item === "object");
+}
+
 export async function loginToNewApi(
   username: string,
   password: string
@@ -240,6 +250,8 @@ export async function getUserFromNewApi(sessionCookie: string): Promise<NewApiUs
 
 export async function searchUserByUsername(username: string): Promise<NewApiUser | null> {
   const baseUrl = getNewApiUrl();
+  const targetUsername = normalizeUsername(username);
+  if (!targetUsername) return null;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const loginResult = await getAdminSessionWithUser(attempt > 0);
@@ -263,9 +275,9 @@ export async function searchUserByUsername(username: string): Promise<NewApiUser
         return null;
       }
 
-      const users = Array.isArray(data.data) ? data.data : [data.data];
+      const users = normalizeUserList(data.data);
       const exactMatch = users.find(
-        (user) => user.username.toLowerCase() === username.toLowerCase()
+        (user) => normalizeUsername(user.username) === targetUsername
       );
       return exactMatch || null;
     } catch (error) {
@@ -323,7 +335,7 @@ export async function findUserByLinuxDoId(linuxdoId: number): Promise<NewApiUser
         }
 
         if (searchResponse.ok && searchData?.success && searchData.data) {
-          const users = Array.isArray(searchData.data) ? searchData.data : [searchData.data];
+          const users = normalizeUserList(searchData.data);
           const matched = findMatchByLinuxDoId(users, targetLinuxDoId);
           if (matched) return matched;
         }
