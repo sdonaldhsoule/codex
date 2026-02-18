@@ -65,6 +65,17 @@ const RECORDS_MIGRATION_CHUNK_SIZE = 500;
 const LOTTERY_CONFIG_MAX_DAILY_LIMIT = 1_000_000;
 const LOTTERY_CONFIG_MAX_TIER_VALUE = 100_000;
 
+const LOTTERY_PENDING_RECORDS_KEY = "lottery:pending_records";
+const PENDING_RECORDS_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 超过 24h 的 pending 视为过期
+
+export interface PendingLotteryRecord {
+  record: LotteryRecord;
+  newApiUserId: number;
+  expectedQuota: number;
+  reservationDay: string;
+  storedAt: number;
+}
+
 let totalRecordsInitPromise: Promise<void> | null = null;
 
 function cloneDefaultLotteryConfig(): LotteryConfig {
@@ -288,21 +299,43 @@ export async function getLotteryConfig(): Promise<LotteryConfig> {
 }
 
 export async function updateLotteryConfig(config: Partial<LotteryConfig>): Promise<void> {
-  const current = await getLotteryConfig();
-  await kv.set(LOTTERY_CONFIG_KEY, { ...current, ...config });
+  const lockKey = `${LOTTERY_CONFIG_KEY}:lock`;
+  const lockToken = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+  const locked = await kv.set(lockKey, lockToken, { nx: true, ex: 5 });
+  if (locked !== "OK") {
+    throw new Error("配置更新冲突，请稍后重试");
+  }
+
+  try {
+    const current = await getLotteryConfig();
+    await kv.set(LOTTERY_CONFIG_KEY, { ...current, ...config });
+  } finally {
+    const releaseLua = `
+      if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('DEL', KEYS[1])
+      end
+      return 0
+    `;
+    try {
+      await kv.eval(releaseLua, [lockKey], [lockToken]);
+    } catch {
+      // ignore
+    }
+  }
 }
 
-export async function tryClaimDailyFree(linuxdoId: number): Promise<boolean> {
-  const today = getTodayDateString();
-  const key = `${LOTTERY_DAILY_PREFIX}${linuxdoId}:${today}`;
+export async function tryClaimDailyFree(linuxdoId: number, today?: string): Promise<boolean> {
+  const day = today ?? getTodayDateString();
+  const key = `${LOTTERY_DAILY_PREFIX}${linuxdoId}:${day}`;
   const ttl = getSecondsUntilMidnight();
   const result = await kv.set(key, "1", { nx: true, ex: ttl });
   return result === "OK";
 }
 
-export async function releaseDailyFree(linuxdoId: number): Promise<void> {
-  const today = getTodayDateString();
-  const key = `${LOTTERY_DAILY_PREFIX}${linuxdoId}:${today}`;
+export async function releaseDailyFree(linuxdoId: number, today?: string): Promise<void> {
+  const day = today ?? getTodayDateString();
+  const key = `${LOTTERY_DAILY_PREFIX}${linuxdoId}:${day}`;
   await kv.del(key);
 }
 
@@ -319,10 +352,10 @@ export async function getTodayDirectTotal(): Promise<number> {
   return (totalCents || 0) / DIRECT_AMOUNT_SCALE;
 }
 
-export async function reserveDailyDirectQuota(dollars: number): Promise<{ success: boolean; newTotal: number }> {
+export async function reserveDailyDirectQuota(dollars: number, today?: string): Promise<{ success: boolean; newTotal: number }> {
   const config = await getLotteryConfig();
-  const today = getTodayDateString();
-  const key = `${LOTTERY_DAILY_DIRECT_KEY}${today}`;
+  const day = today ?? getTodayDateString();
+  const key = `${LOTTERY_DAILY_DIRECT_KEY}${day}`;
   const ttl = getSecondsUntilMidnight() + 3600;
   const cents = Math.round(dollars * DIRECT_AMOUNT_SCALE);
   const limitCents = Math.round(config.dailyDirectLimit * DIRECT_AMOUNT_SCALE);
@@ -352,9 +385,9 @@ export async function reserveDailyDirectQuota(dollars: number): Promise<{ succes
   return { success: success === 1, newTotal: (newTotalCents || 0) / DIRECT_AMOUNT_SCALE };
 }
 
-export async function rollbackDailyDirectQuota(dollars: number): Promise<void> {
-  const today = getTodayDateString();
-  const key = `${LOTTERY_DAILY_DIRECT_KEY}${today}`;
+export async function rollbackDailyDirectQuota(dollars: number, today?: string): Promise<void> {
+  const day = today ?? getTodayDateString();
+  const key = `${LOTTERY_DAILY_DIRECT_KEY}${day}`;
   const cents = Math.round(dollars * DIRECT_AMOUNT_SCALE);
   if (cents <= 0) return;
   await kv.decrby(key, cents);
@@ -378,9 +411,12 @@ export async function spinLotteryDirect(
 ): Promise<{ success: boolean; record?: LotteryRecord; message: string; uncertain?: boolean }> {
   const { creditQuotaToUser } = await import("./new-api");
 
+  // 在开头锁定日期，确保回滚操作使用与预留相同的 day key
+  const today = getTodayDateString();
+
   let usedDailyFree = false;
   try {
-    const dailyResult = await tryClaimDailyFree(linuxdoId);
+    const dailyResult = await tryClaimDailyFree(linuxdoId, today);
     if (!dailyResult) {
       return { success: false, message: "今日免费次数已用完，明天再来吧" };
     }
@@ -392,7 +428,7 @@ export async function spinLotteryDirect(
   const rollbackSpinCount = async () => {
     if (usedDailyFree) {
       try {
-        await releaseDailyFree(linuxdoId);
+        await releaseDailyFree(linuxdoId, today);
       } catch {
         // ignore
       }
@@ -423,7 +459,7 @@ export async function spinLotteryDirect(
       return { success: false, message: "抽奖配置异常，请联系管理员" };
     }
 
-    const reserveResult = await reserveDailyDirectQuota(selectedTier.value);
+    const reserveResult = await reserveDailyDirectQuota(selectedTier.value, today);
     if (!reserveResult.success) {
       await rollbackSpinCount();
       return { success: false, message: "今日发放额度已达上限，请明日再试" };
@@ -449,11 +485,19 @@ export async function spinLotteryDirect(
       } catch {
         // ignore
       }
+      // 存储到 pending 队列，供后续对账验证
+      await storePendingRecord({
+        record: pendingRecord,
+        newApiUserId,
+        expectedQuota: creditResult.newQuota ?? 0,
+        reservationDay: today,
+        storedAt: Date.now(),
+      });
       return { success: false, message: "充值结果不确定，请稍后检查余额", uncertain: true };
     }
 
     if (!creditResult.success) {
-      await rollbackDailyDirectQuota(reservedDollars);
+      await rollbackDailyDirectQuota(reservedDollars, today);
       await rollbackSpinCount();
       return { success: false, message: "充值失败，请稍后重试" };
     }
@@ -484,7 +528,7 @@ export async function spinLotteryDirect(
   } catch (error) {
     console.error("spinLotteryDirect 异常:", error);
     if (reservedDollars > 0) {
-      await rollbackDailyDirectQuota(reservedDollars);
+      await rollbackDailyDirectQuota(reservedDollars, today);
     }
     await rollbackSpinCount();
     return { success: false, message: "系统错误，请稍后再试" };
@@ -573,5 +617,114 @@ export async function getLotteryStats(): Promise<{
     todayUsers: new Set(todayRecords.map((record) => record.linuxdoId)).size,
     todaySpins: todayRecords.length,
     totalRecords,
+  };
+}
+
+// ─── Pending records 对账 ───
+
+async function storePendingRecord(pending: PendingLotteryRecord): Promise<void> {
+  try {
+    await kv.lpush(LOTTERY_PENDING_RECORDS_KEY, pending);
+    await kv.ltrim(LOTTERY_PENDING_RECORDS_KEY, 0, 99);
+  } catch {
+    // ignore
+  }
+}
+
+export async function getPendingRecordCount(): Promise<number> {
+  try {
+    return await kv.llen(LOTTERY_PENDING_RECORDS_KEY);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 对账：验证所有 pending 记录的充值是否到账。
+ * - 已确认到账：从 pending 列表移除
+ * - 确认失败：回滚日额度和每日免费次数，从 pending 列表移除
+ * - 仍不确定或查询失败：保留在 pending 列表
+ * - 超过 24 小时：视为过期移除（避免无限堆积）
+ */
+export async function reconcilePendingRecords(): Promise<{
+  processed: number;
+  confirmed: number;
+  failed: number;
+  expired: number;
+  stillPending: number;
+}> {
+  const { checkUserQuota } = await import("./new-api");
+
+  const allPending = await kv.lrange<PendingLotteryRecord>(LOTTERY_PENDING_RECORDS_KEY, 0, -1);
+  if (allPending.length === 0) {
+    return { processed: 0, confirmed: 0, failed: 0, expired: 0, stillPending: 0 };
+  }
+
+  const now = Date.now();
+  let confirmed = 0;
+  let failed = 0;
+  let expired = 0;
+  const remaining: PendingLotteryRecord[] = [];
+
+  for (const pending of allPending) {
+    if (!pending || !pending.record || typeof pending.newApiUserId !== "number") {
+      expired++;
+      continue;
+    }
+
+    // 超过 24h 视为过期
+    if (now - (pending.storedAt || 0) > PENDING_RECORDS_MAX_AGE_MS) {
+      expired++;
+      console.warn("[reconcile] 过期 pending 记录:", pending.record.id);
+      continue;
+    }
+
+    try {
+      const quotaResult = await checkUserQuota(pending.newApiUserId);
+      if (!quotaResult.success) {
+        remaining.push(pending);
+        continue;
+      }
+
+      if (typeof quotaResult.quota === "number" && quotaResult.quota >= pending.expectedQuota) {
+        confirmed++;
+        console.log("[reconcile] 已确认到账:", pending.record.id);
+      } else {
+        failed++;
+        console.log("[reconcile] 确认未到账，回滚:", pending.record.id);
+        try {
+          await rollbackDailyDirectQuota(pending.record.tierValue, pending.reservationDay);
+        } catch {
+          // ignore
+        }
+        try {
+          await releaseDailyFree(Number(pending.record.linuxdoId), pending.reservationDay);
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      remaining.push(pending);
+    }
+  }
+
+  // 用未解决的记录替换原列表
+  try {
+    await kv.del(LOTTERY_PENDING_RECORDS_KEY);
+    if (remaining.length > 0) {
+      for (const item of remaining) {
+        await kv.lpush(LOTTERY_PENDING_RECORDS_KEY, item);
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return {
+    processed: allPending.length,
+    confirmed,
+    failed,
+    expired,
+    stillPending: remaining.length,
   };
 }

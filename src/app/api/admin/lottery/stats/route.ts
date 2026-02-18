@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getAuthUser, isAdmin } from "@/lib/auth";
-import { getLotteryStats, getLotteryConfig, getLotteryRecords } from "@/lib/lottery";
+import { getLotteryStats, getLotteryConfig, getLotteryRecords, getPendingRecordCount, reconcilePendingRecords } from "@/lib/lottery";
 
 export async function GET() {
   const user = await getAuthUser();
@@ -9,11 +9,22 @@ export async function GET() {
   }
 
   try {
-    const [stats, config, recentRecords] = await Promise.all([
+    const [stats, config, recentRecords, pendingCount] = await Promise.all([
       getLotteryStats(),
       getLotteryConfig(),
       getLotteryRecords(20),
+      getPendingRecordCount(),
     ]);
+
+    // 有 pending 记录时自动触发对账（非阻塞）
+    let reconcileResult = null;
+    if (pendingCount > 0) {
+      try {
+        reconcileResult = await reconcilePendingRecords();
+      } catch (e) {
+        console.error("Auto reconcile failed:", e);
+      }
+    }
 
     return NextResponse.json({
       success: true,
@@ -24,6 +35,8 @@ export async function GET() {
         todaySpins: stats.todaySpins,
         totalRecords: stats.totalRecords,
         enabled: config.enabled,
+        pendingRecords: pendingCount,
+        ...(reconcileResult ? { reconcileResult } : {}),
       },
       recentRecords: recentRecords.slice(0, 10),
     });

@@ -310,6 +310,20 @@ export default function LotteryPage() {
       } else {
         setError(data.message || '抽奖失败');
         setSpinning(false);
+        // 刷新抽奖状态，避免按钮和实际状态不同步
+        try {
+          const lotteryRes = await fetch('/api/lottery');
+          if (lotteryRes.ok) {
+            const lotteryData = await lotteryRes.json();
+            if (lotteryData.success) {
+              setCanSpin(lotteryData.canSpin);
+              setHasSpunToday(lotteryData.hasSpunToday || false);
+              setTiers(Array.isArray(lotteryData.tiers) ? lotteryData.tiers : []);
+            }
+          }
+        } catch {
+          // ignore
+        }
       }
     } catch (err) {
       console.error(err);

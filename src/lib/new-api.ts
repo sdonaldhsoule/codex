@@ -31,6 +31,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * 从 Set-Cookie 头列表中提取纯 cookie 键值对，
+ * 去除 Path / Domain / HttpOnly / Secure / Expires 等属性。
+ */
+function extractCookieValues(setCookieHeaders: string[]): string {
+  return setCookieHeaders
+    .map((header) => header.split(";")[0].trim())
+    .filter(Boolean)
+    .join("; ");
+}
+
 async function acquireUserQuotaLock(userId: number): Promise<UserQuotaLock | null> {
   const key = `${USER_QUOTA_LOCK_PREFIX}${userId}`;
   const token = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -163,11 +174,17 @@ export async function loginToNewApi(
       body: JSON.stringify({ username: safeUsername, password: safePassword }),
     });
 
-    let cookies = response.headers.get("set-cookie") || "";
+    // 优先使用 getSetCookie() 以正确解析多个 Set-Cookie 头，
+    // 然后提取纯键值对（去除 Path / HttpOnly 等属性）
+    let cookies = "";
+    const setCookieHeaders = response.headers.getSetCookie?.();
+    if (setCookieHeaders && setCookieHeaders.length > 0) {
+      cookies = extractCookieValues(setCookieHeaders);
+    }
     if (!cookies) {
-      const setCookieHeader = response.headers.getSetCookie?.();
-      if (setCookieHeader && setCookieHeader.length > 0) {
-        cookies = setCookieHeader.join("; ");
+      const raw = response.headers.get("set-cookie") || "";
+      if (raw) {
+        cookies = extractCookieValues(raw.split(",").map((s) => s.trim()));
       }
     }
 
@@ -537,6 +554,28 @@ export async function creditQuotaToUser(
     return { success: false, message: "管理员会话获取失败" };
   } finally {
     await releaseUserQuotaLock(lock);
+  }
+}
+
+/**
+ * 查询指定用户的当前额度，用于对账验证。
+ */
+export async function checkUserQuota(userId: number): Promise<{ success: boolean; quota?: number }> {
+  const session = await getAdminSessionWithUser();
+  if (!session) return { success: false };
+
+  try {
+    const baseUrl = getNewApiUrl();
+    const response = await fetch(`${baseUrl}/api/user/${userId}`, {
+      headers: buildAdminHeaders(session),
+    });
+    const data = await parseJsonSafe<NewApiResponse<NewApiUser>>(response);
+    if (response.ok && data?.success && data.data) {
+      return { success: true, quota: data.data.quota || 0 };
+    }
+    return { success: false };
+  } catch {
+    return { success: false };
   }
 }
 
